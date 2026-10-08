@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Reminders, calendar and contacts from the terminal, through PIM Bridge.
+
+Installed as three names; each is a thin client for one of the bridge's MCP
+servers, so it does exactly what an agent's MCP tools do.
+
+  reminders                          overdue and due today
+  reminders ls [LIST] [-a|--done] [-s TEXT]
+  reminders lists
+  reminders add TITLE [-l LIST] [-d WHEN] [-r REPEAT] [-n NOTES] [-u URL] [-p PRIORITY]
+  reminders edit ID [-t TITLE] [-l LIST] [-d WHEN] [-r REPEAT] [-n NOTES] [-u URL] [-p PRIORITY]
+  reminders done ID... | undo ID... | rm ID...
+
+  calendar [agenda] [WHEN] [-d DAYS] [-c CAL]   today and the next 6 days
+  calendar today | tomorrow | week
+  calendar search TEXT [-c CAL] [--since WHEN] [--until WHEN] [-n N]
+  calendar show EVENT
+  calendar calendars
+  calendar add TITLE WHEN [--end WHEN | --for DUR] [--all-day] [-c CAL] [-l PLACE]
+               [--notes TEXT] [--repeat RULE] [--link URL]
+  calendar edit EVENT [--title T] [--start WHEN] [--end WHEN | --for DUR] [-l PLACE]
+               [--notes TEXT] [-c CAL] [--all-day | --timed] [--series]
+  calendar delete EVENT [--series]
+  calendar sync
+
+  contacts [QUERY]                   everyone, or the people matching QUERY
+  contacts show CONTACT
+  contacts add [NAME] [--org ORG] [--title T] [-p PHONE]... [-e EMAIL]... [-a ADDRESS]...
+               [-u URL]... [--note TEXT] [--birthday DATE] [--force]
+  contacts edit CONTACT [--name NAME] [--first F] [--last L] [--org ORG] [--title T]
+               [--nickname N] [--note TEXT] [--birthday DATE] [-p PHONE]... [-e EMAIL]...
+               [-a ADDRESS]... [-u URL]... [--remove-phone P]... [--remove-email E]...
+               [--remove-address A]... [--remove-url U]...
+  contacts delete CONTACT
+
+  reminders|calendar|contacts tool NAME [JSON]   call any MCP tool directly
+  pim auth-header                    the bearer header, for MCP clients' headersHelper
+
+WHEN is ISO ("2026-10-12 14:00") or English ("tomorrow 3pm", "next fri", "in 2 hours").
+REPEAT for reminders is daily, weekdays, weekly, monthly, yearly or an RRULE.
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("PIM_BRIDGE_URL", "http://127.0.0.1:8765")
+TOKEN_FILE = os.path.expanduser("~/Library/Application Support/PIMBridge/token")
+SHORT = 6
+tty = sys.stdout.isatty()
+
+
+def die(message):
+    print(f"{PROG}: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    except OSError as e:
+        die(f"can't read the token ({e}); is PIM Bridge installed?")
+
+
+def call(server, tool, **arguments):
+    arguments = {k: v for k, v in arguments.items() if v is not None}
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": tool, "arguments": arguments}}).encode()
+    request = urllib.request.Request(f"{BASE}/{server}/mcp", data=body, method="POST", headers={
+        "Authorization": f"Bearer {token()}", "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            reply = json.load(response)
+    except urllib.error.HTTPError as e:
+        die({401: "the bridge rejected the token"}.get(e.code, f"HTTP {e.code}"))
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        die(f"can't reach PIM Bridge ({getattr(e, 'reason', e)}); "
+            "check `launchctl print gui/$(id -u)/com.ianneub.pim-bridge`")
+    if "error" in reply:
+        die(reply["error"].get("message", "unknown error"))
+    result = reply["result"]
+    text = result["content"][0]["text"]
+    if result.get("isError"):
+        die(text)
+    return text
+
+
+# --- reminders ---------------------------------------------------------------
+
+def color(code, text):
+    return f"\033[{code}m{text}\033[0m" if tty else text
+
+
+def reminder_line(r, show_list=False):
+    bits = [color("36", r["id"][:SHORT].lower()), "✓" if r.get("completed") else "○", r["title"]]
+    if r.get("due"):
+        bits.append(color("33", r["due"].replace("T", " ")))
+    if r.get("recurring"):
+        bits.append(color("2", "↻"))
+    if r.get("priority") not in (None, "none"):
+        bits.append(color("31", "!" * {"low": 1, "medium": 2, "high": 3}[r["priority"]]))
+    if show_list:
+        bits.append(color("2", "· " + r["list"]))
+    out = " ".join(bits)
+    if r.get("notes"):
+        out += "\n" + " " * (SHORT + 3) + color("2", r["notes"].replace("\n", " ")[:100])
+    if r.get("url"):
+        out += "\n" + " " * (SHORT + 3) + color("2", r["url"])
+    return out
+
+
+def reminders(**kw):
+    return json.loads(call("reminders", "list_reminders", limit=1000, **kw))["reminders"]
+
+
+def grouped(items):
+    by_list = {}
+    for r in items:
+        by_list.setdefault(r["list"], []).append(r)
+    return "\n\n".join(color("1", name) + "\n" + "\n".join("  " + reminder_line(r) for r in rs)
+                       for name, rs in sorted(by_list.items())) or color("2", "nothing")
+
+
+def resolve(prefix):
+    """A reminder by id prefix: open ones first, then the most recently completed."""
+    prefix = prefix.lower()
+    for status in ("incomplete", "completed"):
+        hits = [r for r in reminders(status=status) if r["id"].lower().startswith(prefix)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            die(f"{len(hits)} reminders match {prefix}; give more of the id")
+    die(f"no reminder matches {prefix}")
+
+
+def rem_main(argv):
+    p = argparse.ArgumentParser(prog="reminders", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    ls = sub.add_parser("ls")
+    ls.add_argument("list", nargs="?")
+    ls.add_argument("-a", "--all", action="store_true")
+    ls.add_argument("--done", action="store_true")
+    ls.add_argument("-s", "--search")
+    sub.add_parser("lists")
+    for name in ("add", "edit"):
+        q = sub.add_parser(name)
+        q.add_argument("title" if name == "add" else "id")
+        if name == "edit":
+            q.add_argument("-t", "--title")
+        q.add_argument("-l", "--list")
+        q.add_argument("-d", "--due", help='when it is due; "" clears')
+        q.add_argument("-r", "--repeat", help='daily, weekdays, weekly, monthly, yearly or an RRULE; "" stops')
+        q.add_argument("-n", "--notes")
+        q.add_argument("-u", "--url")
+        q.add_argument("-p", "--priority", choices=["none", "low", "medium", "high"])
+    for name in ("done", "undo", "rm"):
+        sub.add_parser(name).add_argument("ids", nargs="+")
+    tool_parser(sub)
+    a = p.parse_args(argv)
+
+    if a.cmd is None:
+        from datetime import date
+        items = reminders(due_before=date.today().isoformat())
+        print("\n".join(reminder_line(r, True) for r in items) or color("2", "nothing due today"))
+    elif a.cmd == "ls":
+        status = "all" if a.all else "completed" if a.done else "incomplete"
+        print(grouped(reminders(status=status, list=a.list, search=a.search)))
+    elif a.cmd == "lists":
+        for l in json.loads(call("reminders", "list_lists")):
+            print(f"{l['name']:<24} {l['open']:>4} open  {color('2', l['account'])}"
+                  + (color("2", "  default") if l["default"] else "") + ("" if l["writable"] else color("2", "  read-only")))
+    elif a.cmd in ("add", "edit"):
+        fields = dict(list=a.list, notes=a.notes, url=a.url, priority=a.priority, due=a.due)
+        if a.repeat is not None:
+            fields["repeat"] = "" if a.repeat.lower() in ("", "never") else repeat_arg(a.repeat)
+        if a.cmd == "add":
+            r = json.loads(call("reminders", "create_reminder", title=a.title, **fields))
+        else:
+            r = json.loads(call("reminders", "update_reminder", id=resolve(a.id)["id"], title=a.title, **fields))
+        print(reminder_line(r, True))
+    elif a.cmd in ("done", "undo"):
+        for i in a.ids:
+            r = json.loads(call("reminders", "complete_reminder", id=resolve(i)["id"], completed=a.cmd == "done"))
+            print(reminder_line(r, True))
+    elif a.cmd == "rm":
+        for i in a.ids:
+            gone = json.loads(call("reminders", "delete_reminder", id=resolve(i)["id"]))["deleted"]
+            print("deleted " + reminder_line(gone, True))
+    elif a.cmd == "tool":
+        run_tool("reminders", a)
+
+
+def repeat_arg(text):
+    """The reminders tools take a repeat object; accept the calendar's words and RRULEs too."""
+    t = text.strip()
+    if t.startswith("{"):
+        return json.loads(t)
+    words = {"daily": {"frequency": "daily"}, "weekly": {"frequency": "weekly"},
+             "monthly": {"frequency": "monthly"}, "yearly": {"frequency": "yearly"},
+             "weekdays": {"frequency": "weekly", "days_of_week": ["mon", "tue", "wed", "thu", "fri"]}}
+    if t.lower() in words:
+        return words[t.lower()]
+    spec = {}
+    days = {"MO": "mon", "TU": "tue", "WE": "wed", "TH": "thu", "FR": "fri", "SA": "sat", "SU": "sun"}
+    for part in t.upper().removeprefix("RRULE:").split(";"):
+        if "=" not in part:
+            die(f"can't read the repeat \"{text}\"; use daily, weekdays, weekly, monthly, yearly, an RRULE or JSON")
+        k, v = part.split("=", 1)
+        if k == "FREQ":
+            spec["frequency"] = v.lower()
+        elif k == "INTERVAL":
+            spec["interval"] = int(v)
+        elif k == "COUNT":
+            spec["count"] = int(v)
+        elif k == "BYDAY":
+            spec["days_of_week"] = [d[:-2] + days[d[-2:]] for d in v.split(",")]
+        elif k == "BYMONTHDAY":
+            spec["days_of_month"] = [int(x) for x in v.split(",")]
+        elif k == "BYMONTH":
+            spec["months_of_year"] = [int(x) for x in v.split(",")]
+        elif k == "BYSETPOS":
+            spec["set_positions"] = [int(x) for x in v.split(",")]
+        elif k == "UNTIL":
+            spec["until"] = f"{v[:4]}-{v[4:6]}-{v[6:8]}"
+    return spec
+
+
+# --- calendar ----------------------------------------------------------------
+
+def cal_main(argv):
+    if not argv or argv[0] not in ("agenda", "today", "tomorrow", "week", "search", "show", "calendars", "add",
+                                   "edit", "delete", "sync", "tool", "-h", "--help"):
+        argv = ["agenda"] + argv
+    p = argparse.ArgumentParser(prog="calendar", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    ag = sub.add_parser("agenda")
+    ag.add_argument("when", nargs="*")
+    ag.add_argument("-d", "--days", type=int, default=7)
+    ag.add_argument("-c", "--calendar")
+    for name in ("today", "tomorrow", "week"):
+        sub.add_parser(name).add_argument("-c", "--calendar")
+    se = sub.add_parser("search")
+    se.add_argument("text", nargs="+")
+    se.add_argument("-c", "--calendar")
+    se.add_argument("--since")
+    se.add_argument("--until")
+    se.add_argument("-n", type=int, default=25)
+    sub.add_parser("show").add_argument("event")
+    sub.add_parser("calendars")
+    ad = sub.add_parser("add")
+    ad.add_argument("title")
+    ad.add_argument("when", nargs="+")
+    ed = sub.add_parser("edit")
+    ed.add_argument("event")
+    ed.add_argument("--title")
+    ed.add_argument("--start")
+    for q in (ad, ed):
+        q.add_argument("--end")
+        q.add_argument("--for", dest="length")
+        q.add_argument("-c", "--calendar")
+        q.add_argument("-l", "--location")
+        q.add_argument("--notes")
+    ad.add_argument("--all-day", action="store_true", default=None)
+    ad.add_argument("--repeat")
+    ad.add_argument("--link")
+    ed.add_argument("--all-day", dest="all_day", action="store_true", default=None)
+    ed.add_argument("--timed", dest="all_day", action="store_false")
+    ed.add_argument("--series", action="store_true")
+    de = sub.add_parser("delete")
+    de.add_argument("event")
+    de.add_argument("--series", action="store_true")
+    sub.add_parser("sync")
+    tool_parser(sub)
+    a = p.parse_args(argv)
+
+    c = lambda tool, **kw: print(call("calendar", tool, **kw))
+    if a.cmd == "agenda":
+        c("list_events", start=" ".join(a.when) or None, days=a.days, calendar=a.calendar)
+    elif a.cmd in ("today", "tomorrow"):
+        c("list_events", start=a.cmd, days=1, calendar=a.calendar)
+    elif a.cmd == "week":
+        c("list_events", days=7, calendar=a.calendar)
+    elif a.cmd == "search":
+        c("search_events", query=" ".join(a.text), calendar=a.calendar, since=a.since, until=a.until, limit=a.n)
+    elif a.cmd == "show":
+        c("get_event", event_id=a.event)
+    elif a.cmd == "calendars":
+        c("list_calendars")
+    elif a.cmd == "add":
+        c("create_event", title=a.title, start=" ".join(a.when), end=a.end, duration=a.length, all_day=a.all_day,
+          calendar=a.calendar, location=a.location, notes=a.notes, repeat=a.repeat, meeting_link=a.link)
+    elif a.cmd == "edit":
+        c("update_event", event_id=a.event, title=a.title, start=a.start, end=a.end, duration=a.length,
+          location=a.location, notes=a.notes, calendar=a.calendar, all_day=a.all_day, series=a.series or None)
+    elif a.cmd == "delete":
+        c("delete_event", event_id=a.event, series=a.series or None)
+    elif a.cmd == "sync":
+        c("sync_calendars")
+    elif a.cmd == "tool":
+        run_tool("calendar", a)
+
+
+# --- contacts ----------------------------------------------------------------
+
+def con_main(argv):
+    if not argv or argv[0] not in ("search", "show", "add", "edit", "delete", "tool", "-h", "--help"):
+        argv = ["search"] + argv
+    p = argparse.ArgumentParser(prog="contacts", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    se = sub.add_parser("search")
+    se.add_argument("query", nargs="*")
+    se.add_argument("-n", type=int, default=500)
+    sub.add_parser("show").add_argument("contact")
+    ad = sub.add_parser("add")
+    ad.add_argument("name", nargs="?", default="")
+    ad.add_argument("--force", action="store_true")
+    ed = sub.add_parser("edit")
+    ed.add_argument("contact")
+    ed.add_argument("--name")
+    ed.add_argument("--first")
+    ed.add_argument("--last")
+    for flag in ("--remove-phone", "--remove-email", "--remove-address", "--remove-url"):
+        ed.add_argument(flag, action="append", default=[])
+    for q in (ad, ed):
+        q.add_argument("--org")
+        q.add_argument("--title")
+        q.add_argument("--nickname")
+        q.add_argument("--note")
+        q.add_argument("--birthday")
+        q.add_argument("-p", "--phone", action="append", default=[])
+        q.add_argument("-e", "--email", action="append", default=[])
+        q.add_argument("-a", "--address", action="append", default=[])
+        q.add_argument("-u", "--url", action="append", default=[])
+    sub.add_parser("delete").add_argument("contact")
+    tool_parser(sub)
+    a = p.parse_args(argv)
+
+    c = lambda tool, **kw: print(call("contacts", tool, **kw))
+    if a.cmd == "search":
+        c("search_contacts", query=" ".join(a.query), limit=a.n)
+    elif a.cmd == "show":
+        c("get_contact", contact=a.contact)
+    elif a.cmd == "add":
+        c("create_contact", name=a.name or None, company=a.org, title=a.title, nickname=a.nickname, note=a.note,
+          birthday=a.birthday, phones=a.phone, emails=a.email, addresses=a.address, urls=a.url, force=a.force or None)
+    elif a.cmd == "edit":
+        c("update_contact", contact=a.contact, name=a.name, first=a.first, last=a.last, company=a.org,
+          title=a.title, nickname=a.nickname, note=a.note, birthday=a.birthday, add_phones=a.phone or None,
+          add_emails=a.email or None, add_addresses=a.address or None, add_urls=a.url or None,
+          remove_phones=a.remove_phone or None, remove_emails=a.remove_email or None,
+          remove_addresses=a.remove_address or None, remove_urls=a.remove_url or None)
+    elif a.cmd == "delete":
+        c("delete_contact", contact=a.contact)
+    elif a.cmd == "tool":
+        run_tool("contacts", a)
+
+
+# --- shared ------------------------------------------------------------------
+
+def tool_parser(sub):
+    t = sub.add_parser("tool", help="call an MCP tool by name with JSON arguments")
+    t.add_argument("name")
+    t.add_argument("json", nargs="?", default="{}")
+
+
+def run_tool(server, a):
+    print(call(server, a.name, **json.loads(a.json)))
+
+
+PROG = os.path.basename(sys.argv[0])
+
+if __name__ == "__main__":
+    try:
+        if PROG == "reminders":
+            rem_main(sys.argv[1:])
+        elif PROG == "calendar":
+            cal_main(sys.argv[1:])
+        elif PROG == "contacts":
+            con_main(sys.argv[1:])
+        elif sys.argv[1:] == ["auth-header"]:
+            print(json.dumps({"Authorization": f"Bearer {token()}"}))
+        else:
+            print(__doc__)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        pass

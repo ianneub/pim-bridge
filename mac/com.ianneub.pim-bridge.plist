@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ianneub.pim-bridge</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<string>com.ianneub.pim-bridge</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@HOME@/Applications/PIMBridge.app/Contents/MacOS/PIMBridge</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Calendar for new events when none is named (name or id); unset = Calendar.app's default. -->
+		<key>PB_DEFAULT_CALENDAR</key>
+		<string>Ian</string>
+	</dict>
+	<!-- Only in the GUI session: that is where the permissions live. -->
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/PIMBridge.log</string>
+</dict>
+</plist>

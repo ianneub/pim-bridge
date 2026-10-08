@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.ianneub.pim-bridge</string>
+	<key>CFBundleName</key>
+	<string>PIM Bridge</string>
+	<key>CFBundleDisplayName</key>
+	<string>PIM Bridge</string>
+	<key>CFBundleExecutable</key>
+	<string>PIMBridge</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>PIM Bridge lets Claude and other agents on this Mac read and change your reminders.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>PIM Bridge lets Claude and other agents on this Mac read and change your reminders.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>PIM Bridge lets Claude and other agents on this Mac read and change your calendars.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>PIM Bridge lets Claude and other agents on this Mac read and change your calendars.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>PIM Bridge writes contact notes through Contacts, since macOS doesn't let other apps write them directly.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>PIM Bridge lets Claude and other agents on this Mac read and change your contacts.</string>
+</dict>
+</plist>
