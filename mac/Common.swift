@@ -11,6 +11,20 @@ func log(_ message: String) {
 
 struct ToolError: Error { let message: String }
 
+let work = DispatchQueue(label: "pim-bridge.work")  // all EventKit and Contacts access is serialized here
+
+/// Where the request being handled came from. Only MenuWidgets' socket is trusted to trash
+/// mail without Touch ID; anything over HTTP could be any process on the Mac.
+enum Caller: String {
+    case http
+    case menuBar = "menu bar"
+}
+
+let callerKey = "pim-bridge.caller"
+
+/// The caller of the tool running on this thread (set by `handle`); HTTP unless proven otherwise.
+var currentCaller: Caller { Thread.current.threadDictionary[callerKey] as? Caller ?? .http }
+
 struct Tool {
     let name: String
     let description: String
@@ -27,8 +41,10 @@ struct Server {
     let tools: [Tool]
     /// nil when access is granted, else what to tell the client.
     let accessProblem: () -> String?
-    /// Run before each tool call, on the work queue.
+    /// Run before each tool call, on `queue`.
     let prepare: () -> Void
+    /// Where its tool calls run.
+    var queue: DispatchQueue = work
 }
 
 func schema(_ properties: [String: Any], required: [String] = []) -> [String: Any] {

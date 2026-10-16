@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Reminders, calendar and contacts from the terminal, through PIM Bridge.
+"""Reminders, calendar, contacts and Gmail from the terminal, through PIM Bridge.
 
-Installed as three names; each is a thin client for one of the bridge's MCP
+Installed as four names; each is a thin client for one of the bridge's MCP
 servers, so it does exactly what an agent's MCP tools do.
 
   reminders                          overdue and due today
@@ -33,11 +33,28 @@ servers, so it does exactly what an agent's MCP tools do.
                [--remove-address A]... [--remove-url U]...
   contacts delete CONTACT
 
-  reminders|calendar|contacts tool NAME [JSON]   call any MCP tool directly
+  gmail                              unread in the inbox, every signed-in account
+  gmail accounts
+  gmail sign-in EMAIL [NAME]         opens the browser; NAME is needed for a new account
+  gmail sign-out ACCOUNT [--remove]
+  gmail search ACCOUNT [QUERY...] [-n N]
+  gmail read ACCOUNT ID [--html]
+  gmail thread ACCOUNT THREAD_ID [--html]
+  gmail drafts ACCOUNT [QUERY...] [-n N]
+  gmail draft ACCOUNT DRAFT_ID [--html]
+  gmail new ACCOUNT [--to ADDR]... [--cc ADDR]... [--bcc ADDR]... [-s SUBJECT]
+               [--html FILE | --text TEXT] [--reply-to MESSAGE_ID]
+  gmail edit ACCOUNT DRAFT_ID [same options; only what you pass changes]
+  gmail trash ACCOUNT ID...          asks for Touch ID on the Mac
+  gmail untrash ACCOUNT ID...
+  gmail log [ACCOUNT] [-d DAYS]
+
+  reminders|calendar|contacts|gmail tool NAME [JSON]   call any MCP tool directly
   pim auth-header                    the bearer header, for MCP clients' headersHelper
 
 WHEN is ISO ("2026-10-12 14:00") or English ("tomorrow 3pm", "next fri", "in 2 hours").
 REPEAT for reminders is daily, weekdays, weekly, monthly, yearly or an RRULE.
+ACCOUNT is a Gmail account's email or name. --html FILE takes - for stdin. Nothing sends mail.
 """
 
 import argparse
@@ -66,7 +83,7 @@ def token():
         die(f"can't read the token ({e}); is PIM Bridge installed?")
 
 
-def call(server, tool, **arguments):
+def call(server, tool, timeout=60, **arguments):
     arguments = {k: v for k, v in arguments.items() if v is not None}
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"name": tool, "arguments": arguments}}).encode()
@@ -74,7 +91,7 @@ def call(server, tool, **arguments):
         "Authorization": f"Bearer {token()}", "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream"})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             reply = json.load(response)
     except urllib.error.HTTPError as e:
         die({401: "the bridge rejected the token"}.get(e.code, f"HTTP {e.code}"))
@@ -363,6 +380,142 @@ def con_main(argv):
         run_tool("contacts", a)
 
 
+# --- gmail -------------------------------------------------------------------
+
+def mail_line(m):
+    unread = color("1", "●") if m.get("unread") else " "
+    date = (m.get("date") or "")[:16].replace("T", " ")
+    sender = m.get("from", "")
+    if "<" in sender and not sender.startswith("<"):
+        sender = sender.split("<")[0].strip().strip('"')
+    return (f"{unread} {color('36', m['id'])} {color('33', date)} {sender[:28]:<28} {m.get('subject') or '(no subject)'}"
+            + ("\n" + " " * 20 + color("2", m["snippet"][:100]) if m.get("snippet") else ""))
+
+
+def show_message(m, html):
+    for key in ("from", "to", "cc", "bcc", "reply_to", "subject", "date"):
+        if m.get(key):
+            print(color("2", f"{key.replace('_', '-').title() + ':':<10}") + f" {m[key]}")
+    for a in m.get("attachments", []):
+        print(color("2", "Attached:  ") + f"{a['filename'] or '(inline)'} ({a['mime_type']}, {a['size']} bytes)")
+    print()
+    print(m.get("html") if html and m.get("html") else m.get("text", ""))
+
+
+def gmail_main(argv):
+    if not argv:
+        argv = ["inbox"]
+    p = argparse.ArgumentParser(prog="gmail", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("inbox")
+    sub.add_parser("accounts")
+    si = sub.add_parser("sign-in")
+    si.add_argument("email")
+    si.add_argument("name", nargs="?")
+    so = sub.add_parser("sign-out")
+    so.add_argument("account")
+    so.add_argument("--remove", action="store_true")
+    for name in ("search", "drafts"):
+        q = sub.add_parser(name)
+        q.add_argument("account")
+        q.add_argument("query", nargs="*")
+        q.add_argument("-n", type=int, default=25)
+    for name, ident in (("read", "id"), ("thread", "thread_id"), ("draft", "draft_id")):
+        q = sub.add_parser(name)
+        q.add_argument("account")
+        q.add_argument(ident)
+        q.add_argument("--html", action="store_true")
+    new = sub.add_parser("new")
+    new.add_argument("account")
+    new.add_argument("--reply-to")
+    ed = sub.add_parser("edit")
+    ed.add_argument("account")
+    ed.add_argument("draft_id")
+    for q in (new, ed):
+        q.add_argument("--to", action="append")
+        q.add_argument("--cc", action="append")
+        q.add_argument("--bcc", action="append")
+        q.add_argument("-s", "--subject")
+        body = q.add_mutually_exclusive_group()
+        body.add_argument("--html", metavar="FILE")
+        body.add_argument("--text")
+    for name in ("trash", "untrash"):
+        q = sub.add_parser(name)
+        q.add_argument("account")
+        q.add_argument("ids", nargs="+")
+    lg = sub.add_parser("log")
+    lg.add_argument("account", nargs="?")
+    lg.add_argument("-d", "--days", type=int, default=30)
+    tool_parser(sub)
+    a = p.parse_args(argv)
+
+    g = lambda tool, **kw: json.loads(call("gmail", tool, **kw))
+    if a.cmd == "inbox":
+        accounts = [x for x in g("accounts")["accounts"] if x["status"] == "signed_in"]
+        if not accounts:
+            die("no Gmail account is signed in; gmail sign-in EMAIL NAME")
+        for x in accounts:
+            found = g("search", account=x["email"], query="is:unread in:inbox", max=50)["messages"]
+            print(color("1", f"{x['name']} · {x['email']}") + color("2", f"  {len(found)} unread"))
+            for m in found:
+                print("  " + mail_line(m).replace("\n", "\n  "))
+    elif a.cmd == "accounts":
+        reply = g("accounts")
+        if reply.get("problem"):
+            print(color("31", reply["problem"]))
+        for x in reply["accounts"]:
+            print(f"{x['name']:<12} {x['email']:<28} {x['status']}" + (color("2", "  " + x["problem"]) if x.get("problem") else ""))
+    elif a.cmd == "sign-in":
+        r = g("sign_in", email=a.email, name=a.name)
+        print(f"Finish signing in {r['email']} in the browser. If no window opened:\n{r['url']}")
+    elif a.cmd == "sign-out":
+        r = g("sign_out", account=a.account, remove=a.remove or None)
+        print(f"signed out {r['signed_out']}" + (" and removed it" if r["removed"] else ""))
+    elif a.cmd == "search":
+        r = g("search", account=a.account, query=" ".join(a.query), max=a.n)
+        print("\n".join(mail_line(m) for m in r["messages"]) or color("2", "nothing"))
+    elif a.cmd == "drafts":
+        r = g("list_drafts", account=a.account, query=" ".join(a.query) or None, max=a.n)
+        for d in r["drafts"]:
+            print(f"{color('36', d['draft_id'])} {color('33', (d.get('date') or '')[:16].replace('T', ' '))} "
+                  f"{(d.get('to') or '(no recipients)')[:30]:<30} {d.get('subject') or '(no subject)'}")
+    elif a.cmd == "read":
+        show_message(g("read_message", account=a.account, id=a.id, html=a.html or None), a.html)
+    elif a.cmd == "thread":
+        for i, m in enumerate(g("read_thread", account=a.account, thread_id=a.thread_id, html=a.html or None)["messages"]):
+            if i:
+                print(color("2", "\n" + "─" * 60 + "\n"))
+            show_message(m, a.html)
+    elif a.cmd == "draft":
+        d = g("get_draft", account=a.account, draft_id=a.draft_id)
+        show_message(d, a.html)
+    elif a.cmd in ("new", "edit"):
+        html = None
+        if a.html:
+            html = sys.stdin.read() if a.html == "-" else open(a.html).read()
+        fields = dict(account=a.account, to=a.to, cc=a.cc, bcc=a.bcc, subject=a.subject, html=html, text=a.text)
+        if a.cmd == "new":
+            d = g("create_draft", reply_to_message_id=a.reply_to, **fields)
+        else:
+            d = g("update_draft", draft_id=a.draft_id, **fields)
+        print(f"draft {d['draft_id']}: {d.get('subject') or '(no subject)'} → {d.get('to') or '(no recipients)'}\n{d['url']}")
+    elif a.cmd in ("trash", "untrash"):
+        if a.cmd == "trash":
+            print(color("2", "Confirm with Touch ID on the Mac..."), file=sys.stderr)
+        r = json.loads(call("gmail", a.cmd, timeout=150, account=a.account, ids=a.ids))
+        for m in r[a.cmd + "ed"]:
+            print(f"{a.cmd}ed {color('36', m['id'])} {m['from'][:30]} · {m['subject']}")
+        for f in r["failed"]:
+            print(color("31", f"failed {f['id']}: {f['error']}"), file=sys.stderr)
+    elif a.cmd == "log":
+        for e in g("trash_log", account=a.account, days=a.days)["entries"]:
+            print(f"{color('33', e['time'][:16].replace('T', ' '))}Z {e['action']:<8} {e['account']:<22} "
+                  f"{color('2', e['caller']):<8} {e['from'][:28]:<28} {e['subject']}")
+    elif a.cmd == "tool":
+        print(call("gmail", a.name, timeout=150, **json.loads(a.json)))
+
+
 # --- shared ------------------------------------------------------------------
 
 def tool_parser(sub):
@@ -385,6 +538,8 @@ if __name__ == "__main__":
             cal_main(sys.argv[1:])
         elif PROG == "contacts":
             con_main(sys.argv[1:])
+        elif PROG == "gmail":
+            gmail_main(sys.argv[1:])
         elif sys.argv[1:] == ["auth-header"]:
             print(json.dumps({"Authorization": f"Bearer {token()}"}))
         else:

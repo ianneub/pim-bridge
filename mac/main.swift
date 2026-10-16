@@ -1,9 +1,12 @@
-// PIM Bridge: serves Apple Reminders, Calendar and Contacts as three MCP servers
-// over Streamable HTTP, to agents on this Mac.
+// PIM Bridge: serves Apple Reminders, Calendar, Contacts and Gmail as four MCP
+// servers over Streamable HTTP, to agents on this Mac.
 //
 //   http://127.0.0.1:8765/reminders/mcp
 //   http://127.0.0.1:8765/calendar/mcp
 //   http://127.0.0.1:8765/contacts/mcp
+//   http://127.0.0.1:8765/gmail/mcp
+//
+// MenuWidgets reaches the Gmail server through a Unix socket instead (Socket.swift).
 //
 // It runs as a LaunchAgent so that macOS gives the Reminders, Calendars and
 // Contacts permissions to this app alone. Otherwise every CLI an agent ran would
@@ -29,12 +32,12 @@ let serverVersion = "2.0.0"
 let supportedProtocolVersions = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 let port = NWEndpoint.Port(rawValue: UInt16(environment["PB_PORT"] ?? "") ?? 8765)!
 let netQueue = DispatchQueue(label: "pim-bridge.net")
-let work = DispatchQueue(label: "pim-bridge.work")  // all EventKit and Contacts access is serialized here
 
 let servers: [String: Server] = [
     "reminders": remindersServer,
     "calendar": calendarServer,
     "contacts": contactsServer,
+    "gmail": gmailServer,
 ]
 
 // MARK: - Auth token
@@ -88,7 +91,7 @@ func textResult(_ value: Any, isError: Bool = false) -> [String: Any] {
 }
 
 /// Returns nil for notifications (and stray responses), which get a bare 202.
-func handle(_ server: Server, _ message: [String: Any]) -> [String: Any]? {
+func handle(_ server: Server, _ message: [String: Any], caller: Caller = .http) -> [String: Any]? {
     guard let id = message["id"], let method = message["method"] as? String else { return nil }
     let params = message["params"] as? [String: Any] ?? [:]
 
@@ -119,6 +122,8 @@ func handle(_ server: Server, _ message: [String: Any]) -> [String: Any]? {
         }
         if let problem = server.accessProblem() { return rpcResult(id, textResult(problem, isError: true)) }
         server.prepare()
+        Thread.current.threadDictionary[callerKey] = caller
+        defer { Thread.current.threadDictionary.removeObject(forKey: callerKey) }
         do {
             return rpcResult(id, textResult(try tool.run(params["arguments"] as? [String: Any] ?? [:])))
         } catch let error as ToolError {
@@ -145,13 +150,15 @@ let loopbackHosts: Set = ["127.0.0.1", "localhost"]
 final class Connection {
     let connection: NWConnection
     var buffer = Data()
+    var routed = false
 
     init(_ connection: NWConnection) { self.connection = connection }
 
     func start() {
         connection.start(queue: netQueue)
-        // Nothing legitimate takes this long; don't let idle sockets pile up.
-        netQueue.asyncAfter(deadline: .now() + 60) { self.connection.cancel() }
+        // No request takes this long to send; don't let idle sockets pile up. Once it has
+        // arrived the tool may take longer (Gmail's trash waits for Touch ID).
+        netQueue.asyncAfter(deadline: .now() + 60) { if !self.routed { self.connection.cancel() } }
         receive()
     }
 
@@ -185,6 +192,7 @@ final class Connection {
     }
 
     func route(_ request: Request) {
+        routed = true
         // Browsers send Origin; MCP clients don't. With the Host check this blocks DNS rebinding.
         if let origin = request.headers["origin"], origin != "null" { return respond(403, nil) }
         let host = (request.headers["host"] ?? "").split(separator: ":").first.map(String.init) ?? ""
@@ -196,7 +204,7 @@ final class Connection {
 
         if request.path == "/health" {
             return respond(200, ["ok": true, "version": serverVersion, "reminders": accessStatus(.reminder),
-                                 "calendar": accessStatus(.event), "contacts": contactsAccess()])
+                                 "calendar": accessStatus(.event), "contacts": contactsAccess(), "gmail": gmailHealth()])
         }
         let parts = request.path.split(separator: "/").map(String.init)
         guard parts.count == 2, parts[1] == "mcp", let server = servers[parts[0]] else { return respond(404, nil) }
@@ -206,7 +214,7 @@ final class Connection {
         guard let message = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any] else {
             return respond(400, rpcError(NSNull(), -32700, "Parse error: expected one JSON-RPC object"))
         }
-        work.async {
+        server.queue.async {
             let reply = handle(server, message)
             netQueue.async { reply.map { self.respond(200, $0) } ?? self.respond(202, nil) }
         }
@@ -247,6 +255,7 @@ func requestAccess() {
     }
 }
 work.async(execute: requestAccess)
+startMenuBarSocket()
 
 let parameters = NWParameters.tcp
 parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)

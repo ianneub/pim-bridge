@@ -2,8 +2,12 @@
 # Builds PIM Bridge and (re)installs it as a LaunchAgent.
 #
 # Signed with the self-signed "MouseRemap Local Signing" identity when it's in the
-# login keychain, so the Reminders, Calendars and Contacts permissions survive
-# rebuilds. Without it the build is signed ad hoc and macOS asks again each time.
+# login keychain, so the Reminders, Calendars and Contacts permissions and the Gmail
+# tokens in the keychain survive rebuilds. Without it the build is signed ad hoc, macOS
+# asks again each time, and the MenuWidgets socket stays off.
+#
+# The hardened runtime stops anything from loading its own code into the bridge
+# (DYLD_INSERT_LIBRARIES) and reading the Gmail tokens as PIM Bridge.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -18,7 +22,7 @@ trap 'rm -rf "$BUILD"' EXIT
 echo "Building..."
 mkdir -p "$BUILD/PIMBridge.app/Contents/MacOS"
 xcrun swiftc -O -swift-version 5 -target arm64-apple-macos14.0 \
-  -o "$BUILD/PIMBridge.app/Contents/MacOS/PIMBridge" Common.swift Reminders.swift Calendar.swift Contacts.swift main.swift
+  -o "$BUILD/PIMBridge.app/Contents/MacOS/PIMBridge" Common.swift Reminders.swift Calendar.swift Contacts.swift Gmail.swift Socket.swift main.swift
 cp Info.plist "$BUILD/PIMBridge.app/Contents/Info.plist"
 
 IDENTITY="MouseRemap Local Signing"
@@ -26,7 +30,8 @@ if ! security find-identity -p codesigning | grep -q "\"$IDENTITY\""; then
   echo "warning: no \"$IDENTITY\" identity; signing ad hoc (permissions reset each rebuild)" >&2
   IDENTITY=-
 fi
-codesign --force --sign "$IDENTITY" --identifier "$LABEL" "$BUILD/PIMBridge.app"
+codesign --force --sign "$IDENTITY" --identifier "$LABEL" --options runtime \
+  --entitlements PIMBridge.entitlements "$BUILD/PIMBridge.app"
 
 echo "Installing $APP..."
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true

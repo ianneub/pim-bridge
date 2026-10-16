@@ -1,13 +1,14 @@
 # PIM Bridge
 
-Apple Reminders, Calendar and Contacts for Claude Code and other agents on this Mac.
+Apple Reminders, Calendar, Contacts and Gmail for Claude Code and other agents on this Mac.
 
-- `mac/`: a small Swift app that runs as a LaunchAgent and serves three MCP servers
+- `mac/`: a small Swift app that runs as a LaunchAgent and serves four MCP servers
   (Streamable HTTP, stateless JSON) on 127.0.0.1:8765:
-  `/reminders/mcp`, `/calendar/mcp`, `/contacts/mcp`.
+  `/reminders/mcp`, `/calendar/mcp`, `/contacts/mcp`, `/gmail/mcp`. MenuWidgets
+  reaches the Gmail server through a Unix socket instead.
 - `cli/pim`: one Python script (system Python 3.9 is enough), installed as
-  `reminders`, `calendar` and `contacts` in `~/.local/bin`. Each calls the same tools
-  the agents get, for agents without MCP, scripts, and terminal use.
+  `reminders`, `calendar`, `contacts` and `gmail` in `~/.local/bin`. Each calls the
+  same tools the agents get, for agents without MCP, scripts, and terminal use.
 
 It replaces three Omarchy-era tools: `reminders-bridge` (the Reminders code moved here
 unchanged apart from date parsing), and the EDS-based `calendar-cli` and `contacts-cli`.
@@ -25,7 +26,7 @@ talks to it over HTTP with a token.
 Claude Code (user scope; already set up):
 
 ```bash
-for n in reminders calendar contacts; do
+for n in reminders calendar contacts gmail; do
   claude mcp add-json -s user $n "{\"type\":\"http\",\"url\":\"http://127.0.0.1:8765/$n/mcp\",\"headersHelper\":\"$HOME/.local/bin/pim auth-header\"}"
 done
 ```
@@ -33,7 +34,7 @@ done
 Other MCP clients: the same URLs, with the header `Authorization: Bearer <token>`
 (`pim auth-header` prints it). Codex, for example, takes `bearer_token_env_var`.
 
-CLI: `reminders --help`, `calendar --help`, `contacts --help`. Dates take ISO
+CLI: `reminders --help`, `calendar --help`, `contacts --help`, `gmail --help`. Dates take ISO
 ("2026-10-12 14:00") or English ("tomorrow 3pm", "next fri", "in 2 hours"). The bridge
 parses them, with NSDataDetector, so the CLI and MCP tools accept the same things.
 
@@ -66,6 +67,74 @@ unless someone has brought it on screen. The scripts run on the main thread: wit
 main run loop running, the AppleEvent reply goes there, and a script on another thread
 waits until it times out.
 
+## Gmail
+
+Ian's Google Workspace accounts, each with a short name (listed in
+`gmail-accounts.json`). The bridge owns the Google sign-in for every client:
+Claude Code (MCP), the `gmail` CLI, and MenuWidgets (over the socket). Signing an
+account out anywhere signs it out everywhere.
+
+- Scope `gmail.modify`: read, search, create and edit drafts, trash and untrash.
+  There is no tool that sends, deletes a draft, or deletes permanently. The scope can't
+  delete permanently; it *can* send, so "never sends" rests on there being no such tool.
+- `update_draft` rewrites a draft in place (`drafts.update`): fields not passed keep
+  their values, and the thread and In-Reply-To/References headers are kept. Bodies are
+  HTML with a generated plain-text alternative. It refuses a draft with attachments
+  (including inline images) rather than drop them. The API doesn't add Gmail's signature.
+- Trash over HTTP (CLI, MCP, anything else) always needs **Touch ID**, with no password
+  fallback: with the lid closed or after too many failed fingerprints, it fails. The
+  prompt says what will happen, e.g. `move 3 emails to Trash in you@example.com:
+  "Subject A", "Subject B", "Subject C"`, or for a batch `move 40 emails to Trash in
+  you@example.com (32 from notifications@github.com, 8 others)`. It's Touch ID, not a
+  dialog, because UI scripting can click dialogs. The bridge can't tell the CLI from an
+  agent, so the prompt describes the action, not the caller. Trash from MenuWidgets over
+  the socket is one click. Untrash never asks.
+- Every trash and untrash is logged with time (UTC), account, message id, sender,
+  subject and caller (`menu bar` or `http`) in `gmail-trash-log.jsonl`, kept 90 days
+  (`trash_log`, `gmail log`).
+- Gmail calls run on their own concurrent queue, so slow Google replies and the
+  Touch ID prompt don't hold up Reminders, Calendar or Contacts.
+
+Files in `~/Library/Application Support/PIMBridge` (all 0600):
+
+| File | What |
+|---|---|
+| `gmail-oauth-client.json` | The Google Cloud "Desktop app" OAuth client, as downloaded |
+| `gmail-accounts.json` | The account list (name, email); MenuWidgets shows what `accounts` reports |
+| `gmail-trash-log.jsonl` | The trash log |
+| `bridge.sock` | MenuWidgets' socket |
+
+Sign in: `gmail sign-in you@example.com Work` (or the `sign_in` tool) opens
+the browser and returns at once; `gmail accounts` shows `signed_in` when it's done.
+The flow is Google's loopback redirect with PKCE, `login_hint`, offline access, and a
+check that the browser signed in the account asked for. When Google rejects a refresh
+token (`invalid_grant`), the account shows `needs_sign_in`.
+
+The Google Cloud project is `pim-bridge` (on Ian's personal Google account), with a Desktop
+client. It's in **Testing**, with the accounts as test users, because a Workspace
+domain blocked the unverified production app asking for `gmail.modify` ("This app is
+blocked"). In Testing, Google ends each sign-in after 7 days, so each account needs
+signing in again weekly. Going back to production would need each Workspace admin to
+mark the client ID as Trusted (Security → API controls → Manage Third-Party App
+Access). An Internal app in a project inside each Workspace organization would also
+work, with one client per account.
+
+Claude Code: the same `claude mcp add-json` line as the others (above), plus
+`"mcp__gmail__trash"` in `permissions.deny` in `~/.claude/settings.json` as an extra
+guard. Touch ID is the real one.
+
+### MenuWidgets' socket
+
+`bridge.sock` carries the same JSON-RPC as HTTP, one JSON object per line each way,
+on a connection that stays open, and serves only the Gmail server. There's no bearer
+token. Before every request the bridge takes the peer's audit token
+(`LOCAL_PEERTOKEN`) and checks the process with `SecCodeCheckValidity` against
+`identifier "com.ianneub.menu-widgets" and certificate leaf = H"<this app's certificate>"`.
+It also requires the hardened runtime and no `get-task-allow`. Without those, anything
+could start the real MenuWidgets with `DYLD_INSERT_LIBRARIES` and use the socket from
+inside it. An ad hoc build of the bridge has no certificate to pin, so the socket stays
+off.
+
 ## Security
 
 | Layer | What it stops |
@@ -73,15 +142,43 @@ waits until it times out.
 | Listens on 127.0.0.1 only | Every other machine |
 | Bearer token, 256 random bits, constant-time compare, on every path | Local processes that can't read the token file |
 | Refuses a browser `Origin` and any `Host` other than 127.0.0.1/localhost | Web pages, including through DNS rebinding |
-| 60 s connection timeout, 4 MB request cap | Idle or oversized connections piling up |
+| 60 s to send a request, 4 MB request cap | Idle or oversized connections piling up |
+| Gmail: no send, draft-delete or permanent-delete tool; scope `gmail.modify` | Agents sending mail or destroying it |
+| Gmail trash over HTTP needs Touch ID, biometrics only, prompt written by the bridge | Anything with the token trashing mail unseen, including by clicking dialogs |
+| Gmail refresh tokens in the login keychain via SecItem, trusted to this app's signature only | Other processes reading a token that could send mail; anything else gets a password prompt |
+| Hardened runtime on the bridge | Code loaded into the bridge (`DYLD_INSERT_LIBRARIES`) reading those tokens as PIM Bridge |
+| Socket 0600 in a 0700 directory; peer checked by audit token and code signature on every request | Anything but a hardened-runtime MenuWidgets signed with the same certificate trashing without Touch ID |
 
 The token is in `~/Library/Application Support/PIMBridge/token` (0600, directory 0700).
 Anything running as Ian that reads it can read and change reminders, calendars and
 contacts. That is the point of the bridge, but it's also the whole boundary.
 
 `install.sh` signs with the self-signed "MouseRemap Local Signing" identity when it's
-in the login keychain, so the permissions survive rebuilds. Ad hoc signing (the
-fallback) means approving all four prompts again after every build.
+in the login keychain, with the hardened runtime (`PIMBridge.entitlements` allows
+Calendars, Contacts and Apple Events). The permissions survive rebuilds, because they
+trust the designated requirement (identifier plus certificate), not one build. The
+Gmail keychain items trust it too, but the login keychain also ties each item to the
+build that wrote it (a `cdhash:` partition, since there's no Team ID). So the first
+Gmail call after a rebuild asks for the login password once per account: enter it and
+choose Always Allow, but only on a prompt that names **PIMBridge**. Deny any other app.
+Each run, before it first uses a token, the bridge reads the item's access list (no
+prompt). If anything besides itself is allowed, which is what "Always Allow" on another
+app's prompt does, it logs that and rewrites the item for itself alone. Sign-in always
+writes a new item for the same reason. Ad hoc signing (the fallback) means approving all four prompts again
+after every build, and no MenuWidgets socket.
+
+The Gmail tokens are stored with SecItem, not `/usr/bin/security`. An item that
+`security` writes trusts `security`, so any process could run `security
+find-generic-password -w` and read it without a prompt. The login keychain still
+belongs to Ian: Keychain Access, with his login password, can always show them.
+
+Hardening that only Ian can do:
+
+- Set the signing identity's private key (Keychain Access → MouseRemap Local Signing →
+  the key → Access Control) to **confirm before every use**, so nothing can silently
+  sign a fake MenuWidgets. That means one confirmation per rebuild.
+- Keep **Accessibility** permission away from terminals, so nothing can UI-script
+  MenuWidgets' Trash button.
 
 ## Operations
 
@@ -97,6 +194,11 @@ new one, so no config changes.
 
 Permissions live in System Settings → Privacy & Security → Reminders, Calendars,
 Contacts, and Automation (PIM Bridge → Contacts).
+
+Gmail: `gmail accounts`, `gmail sign-in EMAIL [NAME]`, `gmail sign-out ACCOUNT`, `gmail
+log`. A new OAuth client means replacing `gmail-oauth-client.json` and signing both
+accounts in again. Signing out revokes the token at Google and deletes the keychain item
+(`com.ianneub.pim-bridge.gmail-token`, account = email).
 
 ## Remote access
 
