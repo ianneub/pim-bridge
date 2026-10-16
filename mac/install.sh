@@ -1,10 +1,12 @@
 #!/bin/bash
 # Builds PIM Bridge and (re)installs it as a LaunchAgent.
 #
-# Signed with the self-signed "MouseRemap Local Signing" identity when it's in the
-# login keychain, so the Reminders, Calendars and Contacts permissions and the Gmail
-# tokens in the keychain survive rebuilds. Without it the build is signed ad hoc, macOS
-# asks again each time, and the MenuWidgets socket stays off.
+# Signed with the "Apple Development" identity (a free Personal Team certificate from
+# Xcode → Settings → Accounts), so the Reminders, Calendars and Contacts permissions and
+# the Gmail tokens in the keychain survive rebuilds: with a Team ID the keychain ties the
+# tokens to the team, not to one build. PB_SIGN_IDENTITY overrides it. Without it, the
+# self-signed "MouseRemap Local Signing" identity (keychain prompts after each rebuild),
+# else ad hoc: macOS asks again each time, and the MenuWidgets socket stays off.
 #
 # The hardened runtime stops anything from loading its own code into the bridge
 # (DYLD_INSERT_LIBRARIES) and reading the Gmail tokens as PIM Bridge.
@@ -25,11 +27,16 @@ xcrun swiftc -O -swift-version 5 -target arm64-apple-macos14.0 \
   -o "$BUILD/PIMBridge.app/Contents/MacOS/PIMBridge" Common.swift Reminders.swift Calendar.swift Contacts.swift Gmail.swift Socket.swift main.swift
 cp Info.plist "$BUILD/PIMBridge.app/Contents/Info.plist"
 
-IDENTITY="MouseRemap Local Signing"
+IDENTITY="${PB_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | sed -n 's/.*"\(Apple Development: .*\)"/\1/p' | head -1)}"
+if [ -z "$IDENTITY" ]; then
+  IDENTITY="MouseRemap Local Signing"
+  echo "warning: no Apple Development identity; signing with \"$IDENTITY\" (keychain asks after each rebuild)" >&2
+fi
 if ! security find-identity -p codesigning | grep -q "\"$IDENTITY\""; then
   echo "warning: no \"$IDENTITY\" identity; signing ad hoc (permissions reset each rebuild)" >&2
   IDENTITY=-
 fi
+echo "Signing as $IDENTITY"
 codesign --force --sign "$IDENTITY" --identifier "$LABEL" --options runtime \
   --entitlements PIMBridge.entitlements "$BUILD/PIMBridge.app"
 

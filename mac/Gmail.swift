@@ -158,6 +158,7 @@ enum TokenStore {
               let acls = SecAccessCopyMatchingACLList(access, kSecACLAuthorizationDecrypt) as? [SecACL]
         else { return nil }
         var others: [String] = []
+        var ownEntries = 0
         for acl in acls {
             var apps: CFArray?
             var description: CFString?
@@ -171,9 +172,12 @@ enum TokenStore {
                 var data: CFData?
                 SecTrustedApplicationCopyData(app, &data)
                 let path = (data as Data?).map { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) } ?? ""
-                if path != Bundle.main.bundlePath { others.append(path.isEmpty ? "an unknown app" : path) }
+                if path == Bundle.main.bundlePath { ownEntries += 1 } else { others.append(path.isEmpty ? "an unknown app" : path) }
             }
         }
+        // A second entry for this app is an older signature (say, the certificate before
+        // a switch); rewriting the item drops it and the old builds' partitions.
+        if ownEntries > 1 { others.append("an older signature of PIM Bridge") }
         return others
     }
 
@@ -788,9 +792,16 @@ func promptSubject(_ subject: String) -> String {
 }
 
 /// What the Touch ID prompt says, after "PIM Bridge is trying to".
-func trashReason(_ account: GmailAccount, _ messages: [[String: Any]]) -> String {
+/// With `threads`, `messages` are thread summaries, and the prompt counts conversations
+/// and the emails in them.
+func trashReason(_ account: GmailAccount, _ messages: [[String: Any]], threads: Bool = false) -> String {
     let count = messages.count
-    let head = "move \(count == 1 ? "1 email" : "\(count) emails") to Trash in \(account.email)"
+    var what = threads ? (count == 1 ? "1 conversation" : "\(count) conversations") : (count == 1 ? "1 email" : "\(count) emails")
+    if threads {
+        let emails = messages.reduce(0) { $0 + ($1["messages"] as? Int ?? 1) }
+        if emails != count { what += " (\(emails) emails)" }
+    }
+    let head = "move \(what) to Trash in \(account.email)"
     if count <= 3 {
         return head + ": " + messages.map { promptSubject($0["subject"] as? String ?? "") }.joined(separator: ", ")
     }
@@ -906,6 +917,77 @@ func moveMail(_ args: [String: Any], trash: Bool) throws -> Any {
         var entry: [String: Any] = ["time": utcTimestamp(Date()), "action": trash ? "trash" : "untrash", "account": account.email,
                                     "id": outcome.id, "from": m["from"] ?? "", "subject": m["subject"] ?? "", "caller": caller.rawValue]
         if trash { entry["inbox"] = (m["labels"] as? [String] ?? []).contains("INBOX") }
+        log.append(entry)
+    }
+    appendTrashLog(log)
+    return [trash ? "trashed" : "untrashed": done, "failed": failed]
+}
+
+/// A thread for the prompt and the log: the first message's subject, the newest one's
+/// sender, how many messages, and whether any is in the inbox.
+func threadSummary(_ account: GmailAccount, _ id: String) throws -> [String: Any] {
+    let thread = try gmail(account, "/threads/\(id)", query: [URLQueryItem(name: "format", value: "metadata")]
+        + ["From", "Subject"].map { URLQueryItem(name: "metadataHeaders", value: $0) })
+    let messages = thread["messages"] as? [[String: Any]] ?? []
+    return ["thread_id": id, "messages": messages.count,
+            "subject": header(messages.first?["payload"] as? [String: Any], "Subject") ?? "",
+            "from": header(messages.last?["payload"] as? [String: Any], "From") ?? "",
+            "inbox": messages.contains { ($0["labelIds"] as? [String] ?? []).contains("INBOX") },
+            "message_ids": messages.compactMap { $0["id"] as? String }]
+}
+
+/// Whole threads, like Gmail's own Trash button: the same rules as `moveMail`.
+func moveThreads(_ args: [String: Any], trash: Bool) throws -> Any {
+    let account = try resolveAccount(args)
+    let ids = try (args["thread_ids"] as? [Any] ?? [args["thread_ids"] as Any])
+        .map { try gmailID($0, "thread_ids: the thread ids to move") }
+    guard !ids.isEmpty else { throw ToolError(message: "Pass thread_ids: the thread ids to move") }
+    guard ids.count <= 500 else { throw ToolError(message: "At most 500 threads at a time") }
+    let threads = try concurrently(Array(Set(ids))) { id -> [String: Any] in
+        do { return try threadSummary(account, id) } catch let error as GmailAPIError where error.status == 404 {
+            throw ToolError(message: "No thread \(id) in \(account.email)")
+        }
+    }
+    let caller = currentCaller
+    if trash && caller != .menuBar { try confirmWithTouchID(trashReason(account, threads, threads: true)) }
+    var backToInbox: Set<String> = []
+    if !trash {
+        trashLogLock.lock()
+        for entry in readTrashLog() where entry["account"] as? String == account.email && entry["action"] as? String == "trash" {
+            guard let id = entry["thread_id"] as? String else { continue }
+            if entry["inbox"] as? Bool ?? false { backToInbox.insert(id) } else { backToInbox.remove(id) }
+        }
+        trashLogLock.unlock()
+    }
+    let outcomes = try concurrently(threads) { t -> String? in
+        let id = t["thread_id"] as? String ?? ""
+        do {
+            _ = try gmail(account, "/threads/\(id)/\(trash ? "trash" : "untrash")", method: "POST")
+            if backToInbox.contains(id) {
+                _ = try gmail(account, "/threads/\(id)/modify", method: "POST", body: ["addLabelIds": ["INBOX"]])
+            }
+            locked { for m in t["message_ids"] as? [String] ?? [] { metadataCache[account.email + "/" + m] = nil } }
+            return nil
+        } catch let error as GmailAPIError {
+            return error.message
+        }
+    }
+    var done: [[String: Any]] = []
+    var failed: [[String: Any]] = []
+    var log: [[String: Any]] = []
+    for (t, error) in zip(threads, outcomes) {
+        let id = t["thread_id"] as? String ?? ""
+        if let error = error {
+            failed.append(["thread_id": id, "error": error])
+            continue
+        }
+        var row: [String: Any] = ["thread_id": id, "from": t["from"] ?? "", "subject": t["subject"] ?? "", "messages": t["messages"] ?? 0]
+        if !trash { row["inbox"] = backToInbox.contains(id) }
+        done.append(row)
+        var entry: [String: Any] = ["time": utcTimestamp(Date()), "action": trash ? "trash" : "untrash", "account": account.email,
+                                    "thread_id": id, "messages": t["messages"] ?? 0, "from": t["from"] ?? "",
+                                    "subject": t["subject"] ?? "", "caller": caller.rawValue]
+        if trash { entry["inbox"] = t["inbox"] ?? false }
         log.append(entry)
     }
     appendTrashLog(log)
@@ -1177,8 +1259,16 @@ let gmailTools: [Tool] = [
          description: "Move messages back out of Trash, and back into the inbox if they were trashed from it through PIM Bridge.",
          schema: schema(["account": accountProperty, "ids": ["type": "array", "items": ["type": "string"], "description": "Message ids"]],
                         required: ["account", "ids"]), readOnly: false, destructive: false, run: { try moveMail($0, trash: false) }),
+    Tool(name: "trash_thread",
+         description: "Move whole threads (every message in each conversation) to Trash, like Gmail's Trash button. Asks Ian for Touch ID on the Mac, with a prompt saying what will be moved; fails without it. Only trash what Ian asked for.",
+         schema: schema(["account": accountProperty, "thread_ids": ["type": "array", "items": ["type": "string"], "description": "Thread ids, from search"]],
+                        required: ["account", "thread_ids"]), readOnly: false, destructive: true, run: { try moveThreads($0, trash: true) }),
+    Tool(name: "untrash_thread",
+         description: "Move whole threads back out of Trash, and back into the inbox if they were trashed from it through PIM Bridge.",
+         schema: schema(["account": accountProperty, "thread_ids": ["type": "array", "items": ["type": "string"], "description": "Thread ids"]],
+                        required: ["account", "thread_ids"]), readOnly: false, destructive: false, run: { try moveThreads($0, trash: false) }),
     Tool(name: "trash_log",
-         description: "Recent trash and untrash actions (kept 90 days), newest first: time, account, message id, sender, subject, and caller (menu bar or http).",
+         description: "Recent trash and untrash actions (kept 90 days), newest first: time, account, message id (or thread_id and message count for whole threads), sender, subject, and caller (menu bar or http).",
          schema: schema(["account": accountProperty, "days": ["type": "integer", "default": 30, "minimum": 1, "maximum": 90],
                          "limit": ["type": "integer", "default": 100, "minimum": 1]]),
          readOnly: true, destructive: false, run: trashLog),

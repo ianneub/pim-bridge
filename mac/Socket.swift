@@ -2,8 +2,9 @@
 //
 // It carries the same JSON-RPC as HTTP, one JSON object per line each way, on a
 // connection that stays open. There's no bearer token: before every request the peer's
-// audit token is checked against a code requirement (MenuWidgets' identifier, signed with
-// this app's own certificate, running with the hardened runtime). Tool calls from here
+// audit token is checked against a code requirement (MenuWidgets' identifier, signed by
+// the same Apple Team ID as this app, or the same certificate for a self-signed build,
+// running with the hardened runtime). Tool calls from here
 // run as `Caller.menuBar`, which may trash mail without Touch ID.
 //
 // The hardened runtime matters: without it, anything could start the real MenuWidgets
@@ -21,8 +22,9 @@ private let csValid: UInt32 = 0x1          // CS_VALID
 private let csGetTaskAllow: UInt32 = 0x4   // CS_GET_TASK_ALLOW: a debugger could attach
 private let csRuntime: UInt32 = 0x10000    // CS_RUNTIME: the hardened runtime
 
-/// MenuWidgets signed with the certificate this app is signed with, or nil when this
-/// build is signed ad hoc (no certificate to pin, so the socket stays off).
+/// MenuWidgets signed by the same developer as this app: the same Apple Team ID when this
+/// app has one (survives certificate renewals), else the same certificate. nil when this
+/// build is signed ad hoc (nothing to pin, so the socket stays off).
 func menuBarRequirement() -> SecRequirement? {
     var me: SecCode?
     var staticMe: SecStaticCode?
@@ -34,8 +36,14 @@ func menuBarRequirement() -> SecRequirement? {
           let leaf = certificates.first
     else { return nil }
     let hash = Insecure.SHA1.hash(data: SecCertificateCopyData(leaf) as Data).map { String(format: "%02x", $0) }.joined()
+    let signer: String
+    if let team = (info as? [String: Any])?[kSecCodeInfoTeamIdentifier as String] as? String, !team.isEmpty {
+        signer = "anchor apple generic and certificate leaf[subject.OU] = \"\(team)\""
+    } else {
+        signer = "certificate leaf = H\"\(hash)\""
+    }
     var requirement: SecRequirement?
-    let text = "identifier \"\(menuBarIdentifier)\" and certificate leaf = H\"\(hash)\""
+    let text = "identifier \"\(menuBarIdentifier)\" and \(signer)"
     guard SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess else { return nil }
     return requirement
 }
@@ -85,7 +93,9 @@ func startMenuBarSocket() {
         close(fd)
         return log("socket off: can't listen on \(path): \(String(cString: strerror(errno)))")
     }
-    log("socket \(path) listening for \(menuBarIdentifier)")
+    var text: CFString?
+    SecRequirementCopyString(requirement, [], &text)
+    log("socket \(path) listening for \((text as String?) ?? menuBarIdentifier)")
     Thread {
         while true {
             let client = accept(fd, nil, nil)

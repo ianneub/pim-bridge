@@ -37,9 +37,11 @@ There is no automated test suite. Testing is manual against the real stores (Ian
 shared with family): use throwaway items prefixed "ZZ" and delete them afterwards, and ask before
 creating, changing or deleting anything.
 
-`install.sh` signs with the "MouseRemap Local Signing" identity if present; otherwise it signs ad hoc
-and macOS re-prompts for all four permissions (Reminders, Calendars, Contacts, Automation → Contacts)
-after every rebuild.
+`install.sh` signs with Ian's "Apple Development" identity (Team ID 8VKFEEQHSC), so permissions and
+the Gmail keychain items survive rebuilds without prompts. MenuWidgets must be signed by the same team
+(the socket pins the Team ID). Fallbacks: "MouseRemap Local Signing" (self-signed, so the keychain asks
+for the password once per account after every rebuild), then ad hoc (macOS re-prompts for all four
+permissions after every rebuild, and the socket stays off).
 
 ## Architecture
 

@@ -74,7 +74,8 @@ Ian's Google Workspace accounts, each with a short name (listed in
 Claude Code (MCP), the `gmail` CLI, and MenuWidgets (over the socket). Signing an
 account out anywhere signs it out everywhere.
 
-- Scope `gmail.modify`: read, search, create and edit drafts, trash and untrash.
+- Scope `gmail.modify`: read, search, create and edit drafts, trash and untrash
+  (single messages, or whole threads with `trash_thread`/`untrash_thread`).
   There is no tool that sends, deletes a draft, or deletes permanently. The scope can't
   delete permanently; it *can* send, so "never sends" rests on there being no such tool.
 - `update_draft` rewrites a draft in place (`drafts.update`): fields not passed keep
@@ -120,8 +121,8 @@ Access). An Internal app in a project inside each Workspace organization would a
 work, with one client per account.
 
 Claude Code: the same `claude mcp add-json` line as the others (above), plus
-`"mcp__gmail__trash"` in `permissions.deny` in `~/.claude/settings.json` as an extra
-guard. Touch ID is the real one.
+`"mcp__gmail__trash"` and `"mcp__gmail__trash_thread"` in `permissions.deny` in
+`~/.claude/settings.json` as an extra guard. Touch ID is the real one.
 
 ### MenuWidgets' socket
 
@@ -129,7 +130,9 @@ guard. Touch ID is the real one.
 on a connection that stays open, and serves only the Gmail server. There's no bearer
 token. Before every request the bridge takes the peer's audit token
 (`LOCAL_PEERTOKEN`) and checks the process with `SecCodeCheckValidity` against
-`identifier "com.ianneub.menu-widgets" and certificate leaf = H"<this app's certificate>"`.
+`identifier "com.ianneub.menu-widgets" and anchor apple generic and certificate
+leaf[subject.OU] = "<this app's Team ID>"`, or this app's certificate hash for a
+self-signed build.
 It also requires the hardened runtime and no `get-task-allow`. Without those, anything
 could start the real MenuWidgets with `DYLD_INSERT_LIBRARIES` and use the socket from
 inside it. An ad hoc build of the bridge has no certificate to pin, so the socket stays
@@ -147,24 +150,28 @@ off.
 | Gmail trash over HTTP needs Touch ID, biometrics only, prompt written by the bridge | Anything with the token trashing mail unseen, including by clicking dialogs |
 | Gmail refresh tokens in the login keychain via SecItem, trusted to this app's signature only | Other processes reading a token that could send mail; anything else gets a password prompt |
 | Hardened runtime on the bridge | Code loaded into the bridge (`DYLD_INSERT_LIBRARIES`) reading those tokens as PIM Bridge |
-| Socket 0600 in a 0700 directory; peer checked by audit token and code signature on every request | Anything but a hardened-runtime MenuWidgets signed with the same certificate trashing without Touch ID |
+| Socket 0600 in a 0700 directory; peer checked by audit token and code signature on every request | Anything but a hardened-runtime MenuWidgets signed by the same Apple team trashing without Touch ID |
 
 The token is in `~/Library/Application Support/PIMBridge/token` (0600, directory 0700).
 Anything running as Ian that reads it can read and change reminders, calendars and
 contacts. That is the point of the bridge, but it's also the whole boundary.
 
-`install.sh` signs with the self-signed "MouseRemap Local Signing" identity when it's
-in the login keychain, with the hardened runtime (`PIMBridge.entitlements` allows
-Calendars, Contacts and Apple Events). The permissions survive rebuilds, because they
-trust the designated requirement (identifier plus certificate), not one build. The
-Gmail keychain items trust it too, but the login keychain also ties each item to the
-build that wrote it (a `cdhash:` partition, since there's no Team ID). So the first
-Gmail call after a rebuild asks for the login password once per account: enter it and
-choose Always Allow, but only on a prompt that names **PIMBridge**. Deny any other app.
+`install.sh` signs with Ian's **Apple Development** identity: a free Personal Team
+certificate (Xcode → Settings → Accounts → Manage Certificates), Team ID `8VKFEEQHSC`.
+It also needs Apple's WWDR G3 intermediate in the keychain. Signing uses the hardened
+runtime (`PIMBridge.entitlements` allows Calendars, Contacts and Apple Events), and
+`PB_SIGN_IDENTITY` overrides the identity. The permissions survive rebuilds, because
+they trust the designated requirement (identifier plus Apple Development certificate),
+not one build. The Gmail keychain items trust it too, and the login keychain ties them
+to the team (`teamid:` partition), so rebuilds don't prompt. With the self-signed
+"MouseRemap Local Signing" fallback there's no Team ID: the partition is each build's
+`cdhash:`, and the first Gmail call after every rebuild asks for the login password,
+once per account. Allow such a prompt only when it names **PIMBridge**; deny any other
+app. The certificate renews yearly; the permissions may ask once more then.
 Each run, before it first uses a token, the bridge reads the item's access list (no
 prompt). If anything besides itself is allowed, which is what "Always Allow" on another
 app's prompt does, it logs that and rewrites the item for itself alone. Sign-in always
-writes a new item for the same reason. Ad hoc signing (the fallback) means approving all four prompts again
+writes a new item for the same reason. Ad hoc signing (the last fallback) means approving all four prompts again
 after every build, and no MenuWidgets socket.
 
 The Gmail tokens are stored with SecItem, not `/usr/bin/security`. An item that
@@ -174,9 +181,9 @@ belongs to Ian: Keychain Access, with his login password, can always show them.
 
 Hardening that only Ian can do:
 
-- Set the signing identity's private key (Keychain Access → MouseRemap Local Signing →
-  the key → Access Control) to **confirm before every use**, so nothing can silently
-  sign a fake MenuWidgets. That means one confirmation per rebuild.
+- Set the signing identity's private key (Keychain Access → the "Apple Development: Ian
+  Neubert" key → Access Control) to **confirm before every use**, so nothing can
+  silently sign a fake MenuWidgets. That means one confirmation per rebuild.
 - Keep **Accessibility** permission away from terminals, so nothing can UI-script
   MenuWidgets' Trash button.
 

@@ -47,6 +47,8 @@ servers, so it does exactly what an agent's MCP tools do.
   gmail edit ACCOUNT DRAFT_ID [same options; only what you pass changes]
   gmail trash ACCOUNT ID...          asks for Touch ID on the Mac
   gmail untrash ACCOUNT ID...
+  gmail trash-thread ACCOUNT THREAD_ID...    whole conversations; Touch ID too
+  gmail untrash-thread ACCOUNT THREAD_ID...
   gmail log [ACCOUNT] [-d DAYS]
 
   reminders|calendar|contacts|gmail tool NAME [JSON]   call any MCP tool directly
@@ -440,7 +442,7 @@ def gmail_main(argv):
         body = q.add_mutually_exclusive_group()
         body.add_argument("--html", metavar="FILE")
         body.add_argument("--text")
-    for name in ("trash", "untrash"):
+    for name in ("trash", "untrash", "trash-thread", "untrash-thread"):
         q = sub.add_parser(name)
         q.add_argument("account")
         q.add_argument("ids", nargs="+")
@@ -500,14 +502,18 @@ def gmail_main(argv):
         else:
             d = g("update_draft", draft_id=a.draft_id, **fields)
         print(f"draft {d['draft_id']}: {d.get('subject') or '(no subject)'} → {d.get('to') or '(no recipients)'}\n{d['url']}")
-    elif a.cmd in ("trash", "untrash"):
-        if a.cmd == "trash":
+    elif a.cmd in ("trash", "untrash", "trash-thread", "untrash-thread"):
+        action, threads = a.cmd.split("-")[0], a.cmd.endswith("-thread")
+        if action == "trash":
             print(color("2", "Confirm with Touch ID on the Mac..."), file=sys.stderr)
-        r = json.loads(call("gmail", a.cmd, timeout=150, account=a.account, ids=a.ids))
-        for m in r[a.cmd + "ed"]:
-            print(f"{a.cmd}ed {color('36', m['id'])} {m['from'][:30]} · {m['subject']}")
+        r = json.loads(call("gmail", action + ("_thread" if threads else ""), timeout=150, account=a.account,
+                            **({"thread_ids": a.ids} if threads else {"ids": a.ids})))
+        key = "thread_id" if threads else "id"
+        for m in r[action + "ed"]:
+            count = f" ({m['messages']} email{'' if m['messages'] == 1 else 's'})" if threads else ""
+            print(f"{action}ed {color('36', m[key])} {m['from'][:30]} · {m['subject']}{count}")
         for f in r["failed"]:
-            print(color("31", f"failed {f['id']}: {f['error']}"), file=sys.stderr)
+            print(color("31", f"failed {f[key]}: {f['error']}"), file=sys.stderr)
     elif a.cmd == "log":
         for e in g("trash_log", account=a.account, days=a.days)["entries"]:
             print(f"{color('33', e['time'][:16].replace('T', ' '))}Z {e['action']:<8} {e['account']:<22} "
