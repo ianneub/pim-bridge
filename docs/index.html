@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PIM Bridge</title>
+<meta name="description" content="Apple Reminders, Calendar, Contacts and Gmail for AI agents and scripts on your own Mac.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>PIM Bridge</h1>
+      <p class="sub">Apple Reminders, Calendar, Contacts and Gmail for AI agents and scripts on your own Mac.</p>
+    </div>
+  </header>
+
+  <p>PIM Bridge is a small, open-source Mac app. It runs in the background and lets
+  programs on the same Mac, such as Claude Code, other AI agents, the command line
+  and menu-bar apps, read and update your reminders, calendars, contacts and Gmail.
+  It runs entirely on your Mac: there is no PIM Bridge server or account, and it
+  accepts connections only from the Mac it runs on.</p>
+
+  <p>Source, install steps and the security design:
+  <a href="https://github.com/ianneub/pim-bridge">github.com/ianneub/pim-bridge</a>.</p>
+
+  <h2>Gmail</h2>
+  <p>PIM Bridge can sign in to your Google account so the programs you connect to it
+  can search and read your mail, write and edit drafts, and move messages to and from
+  Trash. It asks Google for the <code>gmail.modify</code> scope. It has no way to
+  send mail: drafts wait for you to review and send them yourself in Gmail. It
+  can't delete messages or drafts permanently. Moving mail to Trash from anything other
+  than its menu-bar companion needs your fingerprint on the Mac's Touch ID sensor.</p>
+
+  <p>See the <a href="privacy.html">privacy policy</a> and the
+  <a href="terms.html">terms of service</a>.</p>
+
+  <footer>PIM Bridge is MIT licensed.</footer>
+</main>
+</body>
+</html>
